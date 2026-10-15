@@ -11,7 +11,10 @@ semantics, while the shared tests pin the user-facing timeout notice.
 
 import os
 import shlex
+import signal
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -72,6 +75,144 @@ def test_foreground_blocking_command_times_out_with_notice():
 
     assert elapsed < 5, f"timeout not enforced, took {elapsed:.1f}s"
     assert "timed out" in output.lower()
+
+
+@posix_only
+@pytest.mark.parametrize("inherited_fds", [(1,), (2,), (1, 2)], ids=["stdout", "stderr", "both-idle"])
+def test_timeout_releases_pipes_held_by_detached_descendant(tmp_path, monkeypatch, inherited_fds):
+    """Timeout cleanup owns its readers even when a child escapes the killed group."""
+    pid_path = tmp_path / "detached.pid"
+    ready = threading.Event()
+    drains = []
+    processes = []
+    original_append = local_sandbox._BoundedPipeCapture.append
+    original_start_drain = LocalSandbox._start_pipe_drain
+    original_wait = subprocess.Popen.wait
+
+    def observe_append(capture, chunk):
+        original_append(capture, chunk)
+        if b"detached-ready\n" in chunk:
+            ready.set()
+
+    def observe_drain(fd, name, **kwargs):
+        capture, thread = original_start_drain(fd, name, **kwargs)
+        drains.append((fd, thread))
+        return capture, thread
+
+    def wait_after_detach(process, timeout=None):
+        if timeout == 0.2:
+            processes.append(process)
+            # Start the real timeout only after the child has escaped the group.
+            assert ready.wait(5), "detached child did not publish its ready marker"
+        return original_wait(process, timeout)
+
+    monkeypatch.setattr(local_sandbox._BoundedPipeCapture, "append", observe_append)
+    monkeypatch.setattr(LocalSandbox, "_start_pipe_drain", staticmethod(observe_drain))
+    monkeypatch.setattr(subprocess.Popen, "wait", wait_after_detach)
+    monkeypatch.setattr(LocalSandbox, "_get_shell", lambda self: "/bin/sh")
+
+    script = (
+        "import os, pathlib, time\n"
+        "os.setsid()\n"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))\n"
+        f"fds = {inherited_fds!r}\n"
+        "for fd in (1, 2):\n"
+        " if fd not in fds:\n"
+        "  null = os.open(os.devnull, os.O_WRONLY)\n"
+        "  os.dup2(null, fd)\n"
+        "  os.close(null)\n"
+        "os.write(fds[0], b'detached-ready\\n')\n"
+        "while True:\n"
+        " if len(fds) == 1:\n"
+        "  try:\n"
+        "   os.write(fds[0], b'detached-output\\n')\n"
+        "  except BrokenPipeError:\n"
+        "   pass\n"
+        " time.sleep(0.02)\n"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)} & wait"
+    try:
+        output = LocalSandbox("detached-timeout").execute_command(command, timeout=0.2)
+
+        assert output.endswith("Exit Code: 124")
+        assert "detached-ready" in output
+        assert len(drains) == 2
+        for fd, thread in drains:
+            assert not thread.is_alive(), f"reader {thread.name} outlived timeout cleanup"
+            with pytest.raises(OSError):
+                os.fstat(fd)
+    finally:
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            original_wait(process, timeout=5)
+        for _, thread in drains:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "test cleanup leaked a pipe reader"
+
+
+@posix_only
+def test_successful_background_command_keeps_draining_late_output(tmp_path, monkeypatch):
+    """Success still drains inherited pipes after returning to the caller."""
+    pid_path = tmp_path / "background.pid"
+    release_path = tmp_path / "release"
+    drains = []
+    original_start_drain = LocalSandbox._start_pipe_drain
+
+    def observe_drain(fd, name, **kwargs):
+        capture, thread = original_start_drain(fd, name, **kwargs)
+        drains.append((capture, thread))
+        return capture, thread
+
+    monkeypatch.setattr(LocalSandbox, "_start_pipe_drain", staticmethod(observe_drain))
+    monkeypatch.setattr(LocalSandbox, "_get_shell", lambda self: "/bin/sh")
+    script = (
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid()))\n"
+        f"release = pathlib.Path({str(release_path)!r})\n"
+        "while not release.exists():\n"
+        " time.sleep(0.01)\n"
+        "os.write(1, b'late-stdout\\n')\n"
+        "os.write(2, b'late-stderr\\n')\n"
+    )
+    try:
+        LocalSandbox("background-output").execute_command(f"{shlex.quote(sys.executable)} -c {shlex.quote(script)} &", timeout=5)
+        release_path.touch()
+        for _, thread in drains:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert [capture.read() for capture, _ in drains] == ["late-stdout\n", "late-stderr\n"]
+    finally:
+        release_path.touch()
+        if pid_path.exists():
+            try:
+                os.kill(int(pid_path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        for _, thread in drains:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "test cleanup leaked a background pipe reader"
+
+
+@posix_only
+def test_finite_command_drains_all_output_before_return():
+    """A normal exit preserves both pipes' buffered tail and its exit status."""
+    script = "import os; os.write(1, b'o' * 1048576 + b'out-tail'); os.write(2, b'e' * 1048576 + b'err-tail'); raise SystemExit(3)"
+
+    stdout, stderr, returncode, timed_out = LocalSandbox._run_posix_command([sys.executable, "-c", script], timeout=5)
+
+    assert stdout == "o" * 1048576 + "out-tail"
+    assert stderr == "e" * 1048576 + "err-tail"
+    assert returncode == 3
+    assert not timed_out
 
 
 def test_timeout_notice_formats_fractional_and_singular_timeouts(monkeypatch):

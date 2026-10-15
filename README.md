@@ -2516,6 +2516,12 @@ The `write_file` guidance reflects the active model's output token limit, includ
 
 With `AioSandboxProvider`, shell execution runs inside isolated containers. With `LocalSandboxProvider`, file tools still map to per-thread directories on the host, but host `bash` is disabled by default because it is not a secure isolation boundary. Re-enable host bash only for fully trusted local workflows. Host bash commands have a wall-clock timeout, and long-lived processes should be started in the background with output redirected to a workspace log. On Windows, Git Bash/MSYS argument-conversion exclusions are limited to safe non-root virtual path prefixes, so host-native CLI launchers retain their normal MSYS compatibility. When the local sandbox falls back to PowerShell, it captures output as UTF-8 so CJK text does not depend on the Gateway host locale.
 
+On POSIX hosts, a timed-out host command also stops DeerFlow's output readers after
+a short drain grace period, even if a detached descendant still holds the pipes.
+The timeout kills the original process group; descendants that create a separate
+session can survive and require their own lifecycle management. Successful
+background commands continue draining their inherited output as before.
+
 Docker AIO sandboxes default to their existing open egress behavior for
 compatibility. Operators can set `sandbox.network.mode` to `isolated` or
 `allowlist`; allowlist mode supports operator-defined domains and an interactive

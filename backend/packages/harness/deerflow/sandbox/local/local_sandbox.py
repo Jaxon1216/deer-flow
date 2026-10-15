@@ -5,10 +5,12 @@ import logging
 import ntpath
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 600
 _COMMAND_CAPTURE_LIMIT_BYTES = 10 * 1024 * 1024
 _PIPE_DRAIN_JOIN_TIMEOUT_SECONDS = 0.2
+_PIPE_DRAIN_POLL_INTERVAL_SECONDS = 0.05
 
 
 class _BoundedPipeCapture:
@@ -251,8 +254,30 @@ class LocalSandbox(Sandbox):
         )
 
     @staticmethod
-    def _drain_pipe(fd: int, capture: _BoundedPipeCapture) -> None:
+    def _drain_pipe(
+        fd: int,
+        capture: _BoundedPipeCapture,
+        command_done: threading.Event | None = None,
+        stop: threading.Event | None = None,
+    ) -> None:
         try:
+            if command_done is not None:
+                # A timeout must stop our readers even if a detached descendant
+                # still owns a write end. Only this reader closes its fd: closing
+                # a descriptor from another thread need not interrupt os.read.
+                with selectors.DefaultSelector() as selector:
+                    selector.register(fd, selectors.EVENT_READ)
+                    while not command_done.is_set():
+                        if not selector.select(timeout=_PIPE_DRAIN_POLL_INTERVAL_SECONDS):
+                            continue
+                        chunk = os.read(fd, 8192)
+                        if not chunk:
+                            return
+                        capture.append(chunk)
+                if stop is not None and stop.is_set():
+                    return
+                # Successful background commands keep their existing output
+                # drain. Stop polling once the foreground command has finished.
             while chunk := os.read(fd, 8192):
                 capture.append(chunk)
         except OSError:
@@ -272,9 +297,11 @@ class LocalSandbox(Sandbox):
         encoding: str = "utf-8",
         fallback_encoding: str | None = None,
         normalize_newlines: bool = False,
+        command_done: threading.Event | None = None,
+        stop: threading.Event | None = None,
     ) -> tuple[_BoundedPipeCapture, threading.Thread]:
         capture = _BoundedPipeCapture(encoding=encoding, fallback_encoding=fallback_encoding, normalize_newlines=normalize_newlines)
-        thread = threading.Thread(target=LocalSandbox._drain_pipe, args=(fd, capture), name=name, daemon=True)
+        thread = threading.Thread(target=LocalSandbox._drain_pipe, args=(fd, capture, command_done, stop), name=name, daemon=True)
         thread.start()
         return capture, thread
 
@@ -897,8 +924,10 @@ class LocalSandbox(Sandbox):
                     # The write fd may already be closed by the exception cleanup above.
                     pass
 
-        stdout_capture, stdout_thread = LocalSandbox._start_pipe_drain(stdout_read_fd, "deerflow-bash-stdout-drain")
-        stderr_capture, stderr_thread = LocalSandbox._start_pipe_drain(stderr_read_fd, "deerflow-bash-stderr-drain")
+        command_done = threading.Event()
+        stop_drains = threading.Event()
+        stdout_capture, stdout_thread = LocalSandbox._start_pipe_drain(stdout_read_fd, "deerflow-bash-stdout-drain", command_done=command_done, stop=stop_drains)
+        stderr_capture, stderr_thread = LocalSandbox._start_pipe_drain(stderr_read_fd, "deerflow-bash-stderr-drain", command_done=command_done, stop=stop_drains)
         try:
             process_group_id = os.getpgid(process.pid)
         except OSError:
@@ -912,9 +941,19 @@ class LocalSandbox(Sandbox):
                 LocalSandbox._terminate_process_group(process)
             returncode = process.returncode if process.returncode is not None else 0
         finally:
-            join_timeout = 10 if timed_out or not LocalSandbox._process_group_exists(process_group_id) else _PIPE_DRAIN_JOIN_TIMEOUT_SECONDS
+            if timed_out:
+                # Let buffered output reach EOF first, sharing one grace period
+                # across both pipes. Escaped descendants can hold either pipe
+                # indefinitely, so stop local readers after that grace period.
+                deadline = time.monotonic() + _PIPE_DRAIN_JOIN_TIMEOUT_SECONDS
+                for thread in (stdout_thread, stderr_thread):
+                    thread.join(timeout=max(0, deadline - time.monotonic()))
+                stop_drains.set()
+            command_done.set()
+            join_timeout = _PIPE_DRAIN_JOIN_TIMEOUT_SECONDS if timed_out or LocalSandbox._process_group_exists(process_group_id) else 10
+            deadline = time.monotonic() + join_timeout
             for thread in (stdout_thread, stderr_thread):
-                thread.join(timeout=join_timeout)
+                thread.join(timeout=max(0, deadline - time.monotonic()) if timed_out else join_timeout)
                 if thread.is_alive():
                     logger.debug("Subprocess output drain thread still active after command returned")
 
