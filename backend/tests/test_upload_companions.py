@@ -49,18 +49,29 @@ def test_companion_record_accepts_uppercase_markdown_suffix(tmp_path):
 
 def test_same_size_sandbox_rewrite_rejects_stale_outline(converted_upload):
     original, markdown = converted_upload
-    before = original.stat()
     sandbox = LocalSandbox("repro", [PathMapping("/mnt/user-data", str(original.parent.parent))])
-    sandbox.write_file("/mnt/user-data/uploads/report.pdf", "%PDF REPLACED B")
-    # Force a distinct modification time even on coarse-resolution filesystems.
-    os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
-    after = original.stat()
-    assert (before.st_dev, before.st_ino, before.st_size) == (after.st_dev, after.st_ino, after.st_size)
+    for in_place in (True, False):
+        original.write_bytes(b"%PDF ORIGINAL A")
+        register_companion(original, markdown)
+        before = original.stat()
+        if in_place:
+            # Keep timestamp-only coverage even when sandbox writes replace
+            # the inode atomically instead of truncating it in place.
+            original.write_bytes(b"%PDF REPLACED B")
+        else:
+            sandbox.write_file("/mnt/user-data/uploads/report.pdf", "%PDF REPLACED B")
+        # Force a distinct modification time even on coarse-resolution filesystems.
+        os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+        after = original.stat()
+        assert (before.st_dev, before.st_size) == (after.st_dev, after.st_size)
+        if in_place:
+            assert before.st_ino == after.st_ino
+        assert before.st_mtime_ns != after.st_mtime_ns
 
-    assert resolve_companion(original) is None
-    assert companion_names(original.parent) == set()
-    assert extract_outline_for_file(original) == ([], [])
-    assert markdown.read_text(encoding="utf-8") == "# Original A\n"
+        assert resolve_companion(original) is None
+        assert companion_names(original.parent) == set()
+        assert extract_outline_for_file(original) == ([], [])
+        assert markdown.read_text(encoding="utf-8") == "# Original A\n"
 
 
 @pytest.mark.parametrize("timestamp", ["st_mtime_ns", "st_ctime_ns"])

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from deerflow.sandbox.local.list_dir import list_dir
 from deerflow.sandbox.path_patterns import replace_output_path_matches
 from deerflow.sandbox.sandbox import Sandbox, _validate_extra_env
 from deerflow.sandbox.search import GrepMatch, find_glob_matches, find_grep_matches
+from deerflow.utils.atomic_write import publish_bytes_atomically
 
 logger = logging.getLogger(__name__)
 
@@ -1073,11 +1075,13 @@ class LocalSandbox(Sandbox):
             # Resolve container paths in content to local paths
             # using the content-specific resolver (forward-slash safe)
             resolved_content = self._resolve_paths_in_content(content)
-            mode = "a" if append else "w"
             # newline="" writes the content as given; the default would turn
             # every "\n" into "\r\n" on Windows (breaking `bash run.sh`).
-            with open(resolved_path, mode, encoding="utf-8", newline="") as f:
-                f.write(resolved_content)
+            if append:
+                with open(resolved_path, "a", encoding="utf-8", newline="") as f:
+                    f.write(resolved_content)
+            else:
+                self._overwrite_file(resolved_path, resolved_content.encode("utf-8"))
             # Track this path so read_file knows to reverse-resolve on read.
             # Only agent-written files get reverse-resolved; user uploads and
             # external tool output are left untouched.
@@ -1119,6 +1123,29 @@ class LocalSandbox(Sandbox):
             for match in matches
         ], truncated
 
+    @staticmethod
+    def _overwrite_file(path: str, content: bytes) -> None:
+        # Generic sandboxes do not resolve unmapped paths; follow their symlink
+        # targets too, so publication does not replace the symlink itself.
+        target = Path(os.path.realpath(path))
+        existing_stat = None
+        try:
+            fd = os.open(target, os.O_WRONLY | getattr(os, "O_NONBLOCK", 0))
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                # A writable parent alone must not grant replacement of a file
+                # the old in-place open refused (e.g. mode 0400 or an ACL deny).
+                existing_stat = os.fstat(fd)
+                if not stat.S_ISREG(existing_stat.st_mode):
+                    raise OSError(errno.EINVAL, "Atomic overwrite requires a regular file", path)
+            finally:
+                os.close(fd)
+        # An unreplaceable mount or metadata-copy failure must leave the old
+        # file intact; never fall back to a truncating in-place write.
+        publish_bytes_atomically(target, content, existing_stat=existing_stat)
+
     def update_file(self, path: str, content: bytes) -> None:
         resolved = self._resolve_path_with_mapping(path)
         resolved_path = resolved.path
@@ -1128,8 +1155,7 @@ class LocalSandbox(Sandbox):
             dir_path = os.path.dirname(resolved_path)
             if dir_path:
                 os.makedirs(dir_path, exist_ok=True)
-            with open(resolved_path, "wb") as f:
-                f.write(content)
+            self._overwrite_file(resolved_path, content)
         except OSError as e:
             # Re-raise with the original path for clearer error messages, hiding internal resolved paths
             raise type(e)(e.errno, e.strerror, path) from None

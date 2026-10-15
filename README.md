@@ -796,6 +796,15 @@ checkpoint, the runtime resolves the reference against the authenticated user
 and thread before a tool can reuse it. A missing runtime thread ID raises an
 error even when the referenced sandbox is cached.
 
+Local text and binary overwrites publish a complete sibling file before replacing
+the destination, so a failed write preserves its previous content. Existing file
+write-permission checks and symlink-target behavior remain; mode bits are kept
+and new files use the host umask. Append operations remain in place. Overwrites require a
+writable parent directory and fail on unreplaceable file mounts rather than
+truncating them. Replacement changes the named file's inode; other hard links
+retain the previous content. ACLs and extended attributes are not preserved;
+POSIX owner/group copying must succeed before an existing file is replaced.
+
 When host Bash is enabled for Local Execution, DeerFlow starts OS detection with `uname -s`, then uses `sw_vers` on Darwin. On Linux, it reads host system files such as `/etc/os-release` only when the active sandbox policy permits it. Host filesystem path checks still apply; after a blocked path, the agent is directed to use a permitted command-only probe or virtual path instead of repeating the rejected command.
 
 For Docker development, service startup follows `config.yaml` sandbox mode. In Local/Docker modes, `provisioner` is not started.

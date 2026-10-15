@@ -2,6 +2,13 @@
 
 Sandbox restore requires a thread ID, even forks.
 
+Local non-append writes use atomic publication after a non-truncating writable
+open. Preserve symlink targets, mode/umask and POSIX owner/group; never fall back
+to in-place writes. Append is unchanged. Replacement needs a writable parent,
+changes inode, leaves hard-link aliases unchanged, and does not copy ACLs/xattrs.
+Do not gate on NTFS `st_nlink` (#6820). Regressions, including child-process
+EFBIG: `tests/test_local_sandbox_atomic_write.py`.
+
 **Network approval policy**: `SandboxMiddleware` uses
 `resolve_run_interaction_policy()`. Autonomous, webhook, scheduled, legacy
 unattended and GitHub-fallback runs auto-deny; explicit interactive overrides

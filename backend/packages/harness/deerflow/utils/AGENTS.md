@@ -3,9 +3,17 @@
 `atomic_write.publish_bytes_atomically` owns browser screenshot and Browserless
 capture/fetch publication. It writes and fsyncs a hidden exclusive sibling before
 `os.replace`, cleaning it on failure. New files use `0666` filtered by the host
-umask; replacements preserve existing permission bits before publication. Never
+umask; replacement staging starts private (`0600`), then restores permission
+bits after the content is complete. Never
 read the process umask by changing it in this threaded runtime. Behavioral tests
 for both tool imports live in `tests/test_browser_outputs_atomic.py`.
+
+LocalSandbox also uses this publisher after a non-truncating writable-file
+check. Its optional `existing_stat` snapshot preserves descriptor-observed mode
+and POSIX owner/group; copy ownership before mode because chown may clear
+set-ID bits. An ownership-copy error aborts publication. Default browser callers
+retain the mode-only behavior. Replacement does not copy ACLs/xattrs or preserve
+inode identity; sandbox append does not use this helper.
 
 ### Model Retry Hints
 
