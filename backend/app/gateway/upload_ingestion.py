@@ -113,7 +113,7 @@ def _uploads() -> Any:
 
 
 class UnsafeFilenameError(ValueError):
-    """The display filename could not be normalized/claimed; ordinary behavior skips it."""
+    """The display filename could not be normalized; ordinary uploads record it as skipped."""
 
 
 class UnsafeUploadDestinationError(Exception):
@@ -235,7 +235,7 @@ class ThreadUploadIngestionService:
         and request-total size caps (413), an atomic no-overwrite link commit
         with next-suffix retry, and conversion with its companion-name claim
         when ``uploads.auto_convert_documents`` is on. Raises
-        :class:`UnsafeFilenameError` (caller logs and skips),
+        :class:`UnsafeFilenameError` (caller records the display name as skipped),
         :class:`UnsafeUploadDestinationError` (caller records a skipped
         file), ``HTTPException`` (size/over-limit — caller cleans up and
         re-raises) or an unexpected error (caller cleans up and answers 500).

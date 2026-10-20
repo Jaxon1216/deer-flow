@@ -440,6 +440,7 @@ async def upload_files(
                 file_info = await service.ingest_chunks(_stream_upload_file(file), display_name=file.filename)
             except UnsafeFilenameError:
                 logger.warning(f"Skipping file with unsafe filename: {file.filename!r}")
+                skipped_files.append(file.filename)
                 continue
             except UnsafeUploadDestinationError as e:
                 logger.warning("Skipping upload with unsafe destination %s: %s", file.filename, e)

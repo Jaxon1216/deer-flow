@@ -2768,6 +2768,10 @@ ASCII spaces before the extension do not make a device name portable:
 Rename these files before creating or uploading them so the same file tree
 remains usable on Windows.
 
+HTTP uploads list rejected filenames in `skipped_files` and return `success: false`
+even when other files in the batch were stored. The chat stops the message send
+so you can rename the rejected files before retrying.
+
 Uploaded filenames matching `.upload-*.part` are rejected because that pattern is
 reserved for temporary staging files. Rename such a file before uploading it.
 The restriction includes Windows aliases with trailing dots or spaces and

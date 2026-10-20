@@ -1258,8 +1258,9 @@ def test_upload_files_rejects_dotdot_and_dot_filenames(tmp_path):
         for bad_name in ["..", "."]:
             file = UploadFile(filename=bad_name, file=BytesIO(b"data"))
             result = asyncio.run(call_unwrapped(uploads.upload_files, "thread-local", request=MagicMock(), files=[file], config=SimpleNamespace()))
-            assert result.success is True
+            assert result.success is False
             assert result.files == [], f"Expected no files for unsafe filename {bad_name!r}"
+            assert result.skipped_files == [bad_name]
 
         # Path-traversal prefixes are stripped to the basename and accepted safely
         file = UploadFile(filename="../etc/passwd", file=BytesIO(b"data"))
@@ -1267,6 +1268,7 @@ def test_upload_files_rejects_dotdot_and_dot_filenames(tmp_path):
         assert result.success is True
         assert len(result.files) == 1
         assert result.files[0].filename == "passwd"
+        assert result.skipped_files == []
 
     # Only the safely normalised file should exist
     assert [f.name for f in thread_uploads_dir.iterdir()] == ["passwd"]
@@ -1295,8 +1297,65 @@ def test_upload_files_skips_nul_filename_without_rolling_back_valid_file(tmp_pat
             )
         )
 
+    assert result.success is False
+    assert result.skipped_files == ["report\x00.pdf"]
     assert [file.filename for file in result.files] == ["valid.txt"]
     assert (thread_uploads_dir / "valid.txt").read_bytes() == b"kept"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        pytest.param("CON.txt", id="windows-device"),
+        pytest.param("aux.pdf", id="windows-device-extension"),
+        pytest.param("report.txt.", id="trailing-dot"),
+        pytest.param("report.txt ", id="trailing-space"),
+        pytest.param("文" * 86 + ".txt", id="overlong-utf8"),
+        pytest.param("folder\\report.txt", marks=pytest.mark.skipif(os.name == "nt", reason="Windows strips the native backslash separator"), id="backslash"),
+        pytest.param(".", id="dot"),
+        pytest.param("..", id="dotdot"),
+    ],
+)
+@pytest.mark.parametrize("batch", ["single", "unsafe_first", "unsafe_last"])
+def test_upload_files_reports_unsafe_filenames_as_incomplete(tmp_path, filename, batch):
+    user = User(email="unsafe-upload-test@example.com")
+    app = make_authed_test_app(user_factory=lambda: user, bind_current_user=True)
+    app.include_router(uploads.router)
+    app.dependency_overrides[get_config] = lambda: SimpleNamespace()
+    provider = _mounted_provider()
+    unsafe = ("files", (filename, b"rejected attachment"))
+    valid = ("files", ("valid.txt", b"kept attachment"))
+    files = [unsafe] if batch == "single" else [unsafe, valid] if batch == "unsafe_first" else [valid, unsafe]
+
+    with (
+        patch.object(uploads, "ensure_uploads_dir", return_value=tmp_path),
+        patch.object(uploads, "get_sandbox_provider", return_value=provider),
+        TestClient(app) as client,
+    ):
+        response = client.post("/api/threads/thread-local/uploads", files=files)
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["success"] is False
+    assert result["skipped_files"] == [filename]
+    expected_files = [] if batch == "single" else ["valid.txt"]
+    assert [entry["filename"] for entry in result["files"]] == expected_files
+    assert result["message"] == f"Successfully uploaded {len(expected_files)} file(s); skipped 1 unsafe file(s)"
+    assert sorted(path.name for path in tmp_path.iterdir()) == expected_files
+    if expected_files:
+        assert (tmp_path / "valid.txt").read_bytes() == b"kept attachment"
+
+
+@pytest.mark.parametrize("filename", [None, ""])
+def test_upload_files_without_filename_remains_a_validation_error(tmp_path, filename):
+    app = make_authed_test_app()
+    app.include_router(uploads.router)
+    app.dependency_overrides[get_config] = lambda: SimpleNamespace()
+    with patch.object(uploads, "ensure_uploads_dir", return_value=tmp_path) as ensure_uploads, TestClient(app) as client:
+        response = client.post("/api/threads/thread-local/uploads", files={"files": (filename, b"not a file part")})
+
+    assert response.status_code == 422
+    ensure_uploads.assert_not_called()
 
 
 def test_upload_files_rejects_preexisting_symlink_destination(tmp_path):

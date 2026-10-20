@@ -47,9 +47,12 @@ POST /api/threads/{thread_id}/uploads
       "markdown_artifact_url": "/api/threads/{thread_id}/artifacts/mnt/user-data/uploads/document.md"
     }
   ],
-  "message": "Successfully uploaded 1 file(s)"
+  "message": "Successfully uploaded 1 file(s)",
+  "skipped_files": []
 }
 ```
+
+普通文件名校验拒绝的文件（例如 `CON.txt`、末尾带点号或空格的名称、超过 255 个 UTF-8 字节的名称）会列入 `skipped_files`。只要有文件被跳过，HTTP 响应仍为 `200`，但 `success` 为 `false`；混合批次中有效的文件仍会保留。聊天界面会停止本次消息发送，请改名后重试。保留的临时文件名仍按上面的整批预检返回 `400`。
 
 **路径说明：**
 - `path`: 实际文件系统路径（相对于 `backend/` 目录）

@@ -1,5 +1,9 @@
 # Router contracts
 
+HTTP uploads record filenames rejected by normalization in `skipped_files` and
+return `success: false` whenever a file is skipped. Keep valid mixed-batch files;
+reserved staging names still fail the whole batch before ingestion.
+
 Shared scheduled-task update validation preserves an unchanged future `once`
 instant on a live task inside `scheduler.min_once_delay_seconds`; new/changed
 instants and terminal reactivation still enforce the minimum delay.
